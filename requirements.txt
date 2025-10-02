@@ -5,3 +5,4 @@ pydantic==2.9.2
 soundfile==0.12.1
 numpy==1.26.4
 nemo-toolkit[asr]==2.0.0rc0
+huggingface-hub>=0.25.0
