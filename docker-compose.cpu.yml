@@ -1,0 +1,16 @@
+services:
+  canary:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    ports:
+      - "9000:9000"
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "9000"
+      SOURCE_LANG: "ru"
+      TARGET_LANG: "ru"
+      HF_HOME: "/models"
+    volumes:
+      - ./models:/models
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000", "--workers", "1"]
