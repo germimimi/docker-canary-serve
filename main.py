@@ -1,3 +1,5 @@
+"""FastAPI service for NVIDIA Canary ASR - CPU inference."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,139 +8,162 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict
 
-import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse
 
-from canary_api.engine import load_engine
+from canary_api.engine import CanaryEngine
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 LOGGER = logging.getLogger("canary.api")
 
+# Configuration
 DEFAULT_SOURCE_LANG = os.getenv("SOURCE_LANG", "ru")
 DEFAULT_TARGET_LANG = os.getenv("TARGET_LANG", "ru")
-MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE", str(200 * 1024 * 1024)))
-SUPPORTED_EXTENSIONS = {".wav", ".m4a", ".flac"}
-MODEL_NAME = "nvidia/canary-1b-v2"
+MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE", str(200 * 1024 * 1024)))  # 200MB
 
-engine = load_engine()
+# Supported languages (25 European languages from NVIDIA Canary 1B V2)
+SUPPORTED_LANGUAGES = {
+    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr",
+    "ga", "hr", "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt",
+    "ro", "ru", "sk", "sl", "sv"
+}
 
+# Initialize engine
+engine = CanaryEngine.instance()
+
+# Create FastAPI app
 app = FastAPI(
-    title="NVIDIA Canary 1B V2 ASR API",
+    title="NVIDIA Canary ASR API",
     version="2.0.0",
-    description="FastAPI server for CPU inference with NVIDIA Canary 1B V2",
+    description="CPU-based ASR service for m4a audio files using NVIDIA Canary 1B V2",
 )
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    LOGGER.info("Application startup: ensuring model is loaded.")
+    """Pre-load model on startup."""
+    LOGGER.info("Starting up: loading NVIDIA Canary model...")
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, engine.get_model)
-    LOGGER.info("Model loaded and ready for inference.")
+    try:
+        await loop.run_in_executor(None, engine.get_model)
+        LOGGER.info("Model loaded successfully and ready for inference.")
+    except Exception as exc:
+        LOGGER.exception("Failed to load model during startup")
+        raise RuntimeError(f"Model initialization failed: {exc}") from exc
 
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
+    """Health check endpoint."""
     if not engine.is_ready():
         raise HTTPException(status_code=503, detail="Model is still loading")
     return {"status": "ok"}
 
 
 @app.post("/inference")
-async def run_inference(
+async def inference(
     file: UploadFile = File(...),
     source_lang: str = Form(DEFAULT_SOURCE_LANG),
     target_lang: str = Form(DEFAULT_TARGET_LANG),
-    timestamps: str = Form("no"),
-    response_format: str = Form("json"),
-    beam_size: int = Form(1),
-    batch_size: int = Form(1),
-) -> Response:
+    timestamps: bool = Form(False),
+) -> JSONResponse:
+    """
+    Transcribe m4a audio file.
+
+    Args:
+        file: Audio file in m4a format
+        source_lang: Source language (ISO 639-1 code)
+        target_lang: Target language (ISO 639-1 code)
+        timestamps: Whether to include timestamps in response
+
+    Returns:
+        JSON with transcription text and optional segments
+    """
+    # Validate file
     if not file.filename:
-        raise HTTPException(status_code=400, detail="Uploaded file must have a filename")
+        raise HTTPException(status_code=400, detail="Missing filename")
 
     extension = Path(file.filename).suffix.lower()
-    if extension not in SUPPORTED_EXTENSIONS:
+    if extension != ".m4a":
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{extension}'. Allowed extensions: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
+            detail=f"Unsupported file format '{extension}'. Only .m4a files are supported.",
         )
 
-    timestamps_requested = _parse_bool(timestamps)
-    response_format_normalized = response_format.strip().lower()
-    if response_format_normalized not in {"json", "verbose_json", "text", "srt", "vtt"}:
-        raise HTTPException(status_code=400, detail="Unsupported response_format value")
+    # Validate languages
+    if source_lang not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported source language '{source_lang}'. Supported: {sorted(SUPPORTED_LANGUAGES)}",
+        )
 
-    need_segments = timestamps_requested or response_format_normalized in {"srt", "vtt"}
+    if target_lang not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported target language '{target_lang}'. Supported: {sorted(SUPPORTED_LANGUAGES)}",
+        )
 
+    # Process file
     with tempfile.TemporaryDirectory(prefix="canary_") as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         input_path = tmp_dir_path / f"input{extension}"
+
+        # Save uploaded file
         file_size = await _save_upload_to_disk(file, input_path)
+
         if file_size == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
         if file_size > MAX_FILE_SIZE_BYTES:
-            raise HTTPException(status_code=413, detail="Uploaded file is too large")
-
-        processed_path = _prepare_audio(input_path, extension, tmp_dir_path)
-
-        try:
-            result = engine.transcribe(
-                processed_path,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                timestamps=need_segments,
-                beam_size=beam_size,
-                batch_size=batch_size,
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE_BYTES // (1024*1024)}MB",
             )
-        except Exception as exc:  # pragma: no cover - propagated to client
-            LOGGER.exception("Inference failed")
-            raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 
+        # Convert m4a to WAV (16kHz mono)
+        wav_path = await _convert_to_wav(input_path, tmp_dir_path)
+
+        # Run transcription (non-blocking)
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                engine.transcribe,
+                wav_path,
+                source_lang,
+                target_lang,
+                timestamps,
+            )
+        except Exception as exc:
+            LOGGER.exception("Transcription failed")
+            raise HTTPException(
+                status_code=500,
+                detail="Transcription failed. Please try again.",
+            ) from exc
+
+    # Build response
     text = result.get("text", "").strip()
-    segments = result.get("segments", []) if need_segments else []
+    response: Dict[str, Any] = {"text": text}
 
-    if response_format_normalized == "json":
-        payload: Dict[str, object] = {"text": text}
-        if timestamps_requested:
-            payload["segments"] = segments
-        return JSONResponse(content=payload)
+    if timestamps:
+        segments = result.get("segments", [])
+        response["segments"] = segments
 
-    if response_format_normalized == "verbose_json":
-        verbose_payload = {
-            "text": text,
-            "model": MODEL_NAME,
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-            "segments": segments,
-        }
-        return JSONResponse(content=verbose_payload)
-
-    if response_format_normalized == "text":
-        return PlainTextResponse(content=text)
-
-    formatted_segments = segments if segments else [{"start": 0.0, "end": 0.0, "text": text}]
-
-    if response_format_normalized == "srt":
-        return PlainTextResponse(content=_segments_to_srt(formatted_segments), media_type="application/x-subrip")
-
-    if response_format_normalized == "vtt":
-        return PlainTextResponse(content=_segments_to_vtt(formatted_segments), media_type="text/vtt")
-
-    raise HTTPException(status_code=500, detail="Unhandled response format")
+    return JSONResponse(content=response)
 
 
 async def _save_upload_to_disk(upload: UploadFile, destination: Path) -> int:
+    """Save uploaded file to disk and return size in bytes."""
     size = 0
     with destination.open("wb") as buffer:
         while True:
-            chunk = await upload.read(1024 * 1024)
+            chunk = await upload.read(1024 * 1024)  # 1MB chunks
             if not chunk:
                 break
             size += len(chunk)
@@ -147,22 +172,8 @@ async def _save_upload_to_disk(upload: UploadFile, destination: Path) -> int:
     return size
 
 
-def _prepare_audio(input_path: Path, extension: str, tmp_dir_path: Path) -> Path:
-    if extension != ".wav":
-        return _convert_to_wav(input_path, tmp_dir_path)
-
-    try:
-        info = sf.info(str(input_path))
-        if info.samplerate == 16000 and info.channels == 1:
-            return input_path
-        LOGGER.info("Re-sampling WAV file from %s Hz / %s channels", info.samplerate, info.channels)
-    except RuntimeError:
-        LOGGER.info("soundfile could not read WAV metadata, forcing conversion")
-
-    return _convert_to_wav(input_path, tmp_dir_path)
-
-
-def _convert_to_wav(input_path: Path, tmp_dir_path: Path) -> Path:
+async def _convert_to_wav(input_path: Path, tmp_dir_path: Path) -> Path:
+    """Convert audio to WAV format (16kHz mono) using ffmpeg."""
     output_path = tmp_dir_path / "converted.wav"
     command = [
         "ffmpeg",
@@ -170,62 +181,37 @@ def _convert_to_wav(input_path: Path, tmp_dir_path: Path) -> Path:
         "-i",
         str(input_path),
         "-ac",
-        "1",
+        "1",  # mono
         "-ar",
-        "16000",
+        "16000",  # 16kHz
         str(output_path),
     ]
-    LOGGER.info("Running ffmpeg conversion: %s", " ".join(command))
+
+    LOGGER.info("Converting audio: %s", " ".join(command))
+
+    loop = asyncio.get_running_loop()
     try:
-        completed = subprocess.run(command, capture_output=True, check=True)
+        completed = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(command, capture_output=True, check=True)
+        )
         if completed.stderr:
             LOGGER.debug("ffmpeg stderr: %s", completed.stderr.decode(errors="ignore"))
     except subprocess.CalledProcessError as exc:
-        LOGGER.error("ffmpeg conversion failed: %s", exc.stderr.decode(errors="ignore"))
-        raise HTTPException(status_code=500, detail="Failed to convert audio to WAV") from exc
+        LOGGER.error("Audio conversion failed: %s", exc.stderr.decode(errors="ignore"))
+        raise HTTPException(
+            status_code=500,
+            detail="Audio conversion failed. Please ensure the file is a valid m4a audio file.",
+        ) from exc
+
     return output_path
-
-
-def _parse_bool(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _format_timestamp(seconds: float, separator: str) -> str:
-    total_ms = max(seconds, 0.0) * 1000.0
-    hours = int(total_ms // 3_600_000)
-    minutes = int((total_ms % 3_600_000) // 60_000)
-    secs = (total_ms % 60_000) / 1000.0
-    if separator == ",":
-        return f"{hours:02}:{minutes:02}:{secs:06.3f}".replace(".", ",")
-    return f"{hours:02}:{minutes:02}:{secs:06.3f}"
-
-
-def _segments_to_srt(segments: Iterable[Dict[str, object]]) -> str:
-    lines: List[str] = []
-    for idx, segment in enumerate(segments, start=1):
-        start = float(segment.get("start", 0.0))
-        end = float(segment.get("end", start))
-        text = str(segment.get("text", "")).strip()
-        lines.append(str(idx))
-        lines.append(f"{_format_timestamp(start, ',')} --> {_format_timestamp(end, ',')}")
-        lines.append(text)
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
-
-
-def _segments_to_vtt(segments: Iterable[Dict[str, object]]) -> str:
-    lines: List[str] = ["WEBVTT", ""]
-    for segment in segments:
-        start = float(segment.get("start", 0.0))
-        end = float(segment.get("end", start))
-        text = str(segment.get("text", "")).strip()
-        lines.append(f"{_format_timestamp(start, '.')} --> {_format_timestamp(end, '.')}")
-        lines.append(text)
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host=os.getenv("APP_HOST", "0.0.0.0"), port=int(os.getenv("APP_PORT", "9000")))
+    uvicorn.run(
+        app,
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("APP_PORT", "9000")),
+    )

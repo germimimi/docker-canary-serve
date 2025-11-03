@@ -1,7 +1,61 @@
+# IDE
 /.idea/
-/.venv/
-docker-compose.yml
-__pycache__
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+.tox/
+*.egg-info/
+dist/
+build/
+
+# Environment
 .env
+.env.local
+
+# Models (large files)
+models/
+*.nemo
+*.pt
+*.pth
+*.ckpt
+
+# Audio files
 *.wav
+*.m4a
+*.flac
+*.mp3
+
+# Subtitles
 *.srt
+*.vtt
+
+# Docker
+docker-compose.yml
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

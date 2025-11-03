@@ -1,8 +1,12 @@
 FROM python:3.11-slim
 
+# Prevent Python from writing pyc files and buffering stdout/stderr
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ffmpeg \
@@ -13,16 +17,35 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Create non-root user
+RUN groupadd -r canary && \
+    useradd -r -g canary -u 1000 -m -s /bin/bash canary
+
+# Set working directory
 WORKDIR /app
 
+# Copy requirements and install Python dependencies
 COPY requirements.txt ./
 
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==2.3.*" && \
     pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy application code
+COPY --chown=canary:canary . .
 
+# Create models directory with proper permissions
+RUN mkdir -p /models && chown -R canary:canary /models
+
+# Switch to non-root user
+USER canary
+
+# Expose port
 EXPOSE 9000
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:9000/health').raise_for_status()" || exit 1
+
+# Run application
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000", "--workers", "1"]

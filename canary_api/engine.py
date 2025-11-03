@@ -1,4 +1,4 @@
-"""Model loading and inference helpers for NVIDIA Canary ASR."""
+"""NVIDIA Canary ASR model engine with lazy loading and thread-safety."""
 
 from __future__ import annotations
 
@@ -9,22 +9,24 @@ from typing import Any, Dict, List, Optional
 
 from nemo.collections.asr.models import ASRModel
 
-_LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 class CanaryEngine:
-    """Lazily loads the Canary model and performs transcription."""
+    """Thread-safe singleton for NVIDIA Canary model."""
 
-    _instance: Optional["CanaryEngine"] = None
+    _instance: Optional[CanaryEngine] = None
     _instance_lock = threading.Lock()
 
     def __init__(self) -> None:
+        """Initialize engine (use .instance() instead)."""
         self._model: Optional[ASRModel] = None
         self._model_lock = threading.Lock()
         self._model_ready = threading.Event()
 
     @classmethod
-    def instance(cls) -> "CanaryEngine":
+    def instance(cls) -> CanaryEngine:
+        """Get singleton instance."""
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
@@ -32,22 +34,22 @@ class CanaryEngine:
         return cls._instance
 
     def is_ready(self) -> bool:
+        """Check if model is loaded and ready."""
         return self._model_ready.is_set()
 
-    def _load_model(self) -> ASRModel:
+    def get_model(self) -> ASRModel:
+        """Load and return the model (thread-safe, lazy)."""
         if self._model is None:
             with self._model_lock:
                 if self._model is None:
-                    _LOGGER.info("Loading NVIDIA Canary model 'nvidia/canary-1b-v2' on CPU…")
+                    LOGGER.info("Loading NVIDIA Canary model 'nvidia/canary-1b-v2'...")
                     model = ASRModel.from_pretrained(model_name="nvidia/canary-1b-v2")
                     model.to("cpu")
                     model.eval()
                     self._model = model
                     self._model_ready.set()
+                    LOGGER.info("Model loaded successfully")
         return self._model
-
-    def get_model(self) -> ASRModel:
-        return self._load_model()
 
     def transcribe(
         self,
@@ -55,128 +57,135 @@ class CanaryEngine:
         source_lang: str,
         target_lang: str,
         timestamps: bool,
-        beam_size: Optional[int] = None,
-        batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Run transcription and return text plus optional segments."""
+        """
+        Transcribe audio file.
 
-        model = self._load_model()
+        Args:
+            audio_path: Path to WAV audio file (16kHz mono)
+            source_lang: Source language code (ISO 639-1)
+            target_lang: Target language code (ISO 639-1)
+            timestamps: Whether to return timestamps
 
-        kwargs: Dict[str, Any] = {}
-        if source_lang:
-            kwargs["source_lang"] = source_lang
-        if target_lang:
-            kwargs["target_lang"] = target_lang
-        if beam_size is not None:
-            kwargs["beam_size"] = beam_size
-        if batch_size is not None:
-            kwargs["batch_size"] = batch_size
+        Returns:
+            Dictionary with 'text' and optional 'segments'
+        """
+        model = self.get_model()
 
-        use_hypotheses = timestamps
+        # Build transcription parameters
+        kwargs: Dict[str, Any] = {
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+        }
+
         if timestamps:
             kwargs["return_hypotheses"] = True
 
-        result: Any = None
-        attempt_kwargs = dict(kwargs)
+        # Call model
+        LOGGER.info(
+            "Transcribing audio: source=%s, target=%s, timestamps=%s",
+            source_lang,
+            target_lang,
+            timestamps,
+        )
 
-        while True:
-            try:
-                result = model.transcribe([str(audio_path)], **attempt_kwargs)
-                break
-            except TypeError as exc:
-                if not attempt_kwargs:
-                    raise
-                key, _ = attempt_kwargs.popitem()
-                _LOGGER.warning("Model.transcribe rejected argument '%s': %s", key, exc)
-                if key == "return_hypotheses":
-                    use_hypotheses = False
-            except Exception:
-                _LOGGER.exception("Canary transcription failed")
-                raise
+        try:
+            result = model.transcribe([str(audio_path)], **kwargs)
+        except TypeError as exc:
+            # Fallback: model may not support all parameters
+            LOGGER.warning("Model rejected parameters, retrying without them: %s", exc)
+            result = model.transcribe([str(audio_path)])
+            timestamps = False  # Disable timestamps on fallback
 
-        text, segments = _parse_transcription_output(result, use_hypotheses)
+        # Parse result
+        text, segments = _parse_result(result, timestamps)
         return {"text": text, "segments": segments}
 
 
-def _parse_transcription_output(result: Any, use_hypotheses: bool) -> tuple[str, List[Dict[str, Any]]]:
-    text: str = ""
+def _parse_result(result: Any, use_timestamps: bool) -> tuple[str, List[Dict[str, Any]]]:
+    """Parse NeMo transcription result."""
+    text = ""
     segments: List[Dict[str, Any]] = []
 
+    if not result:
+        return text, segments
+
+    # Extract text
     if isinstance(result, list) and result:
         first = result[0]
         if hasattr(first, "text"):
-            text = getattr(first, "text") or ""
+            text = str(first.text or "")
         elif isinstance(first, str):
             text = first
         else:
             text = str(first)
 
-        if use_hypotheses and hasattr(first, "segments"):
-            raw_segments = getattr(first, "segments") or []
-            segments = _convert_segments(raw_segments)
-        elif use_hypotheses and hasattr(first, "words"):
-            raw_segments = getattr(first, "words") or []
-            segments = _convert_word_segments(raw_segments)
-        elif isinstance(first, str):
-            text = first
+        # Extract segments/timestamps if available
+        if use_timestamps and hasattr(first, "segments"):
+            segments = _extract_segments(first.segments)
+        elif use_timestamps and hasattr(first, "words"):
+            segments = _extract_word_segments(first.words)
     elif isinstance(result, str):
         text = result
 
-    text = text.strip()
-
-    if not segments:
-        segments = []
-
-    return text, segments
+    return text.strip(), segments
 
 
-def _convert_segments(raw_segments: Any) -> List[Dict[str, Any]]:
-    converted: List[Dict[str, Any]] = []
+def _extract_segments(raw_segments: Any) -> List[Dict[str, Any]]:
+    """Extract segments with timestamps."""
+    segments: List[Dict[str, Any]] = []
+
+    if not raw_segments:
+        return segments
+
     for seg in raw_segments:
-        start = _safe_get(seg, "start_time", "start", "start_offset")
-        end = _safe_get(seg, "end_time", "end", "end_offset")
-        content = _safe_get(seg, "text", "content", default="")
-        if start is None or end is None:
-            continue
-        converted.append(
-            {
+        start = _get_attr(seg, "start_time", "start", "start_offset")
+        end = _get_attr(seg, "end_time", "end", "end_offset")
+        text = _get_attr(seg, "text", "content", default="")
+
+        if start is not None and end is not None:
+            segments.append({
                 "start": float(start),
                 "end": float(end),
-                "text": str(content).strip(),
-            }
-        )
-    return converted
+                "text": str(text).strip(),
+            })
+
+    return segments
 
 
-def _convert_word_segments(raw_segments: Any) -> List[Dict[str, Any]]:
-    converted: List[Dict[str, Any]] = []
-    for word in raw_segments:
-        start = _safe_get(word, "start_time", "start_offset", "start")
-        end = _safe_get(word, "end_time", "end_offset", "end")
-        token = _safe_get(word, "text", "word", default="")
-        if start is None or end is None:
-            continue
-        converted.append(
-            {
+def _extract_word_segments(raw_words: Any) -> List[Dict[str, Any]]:
+    """Extract word-level timestamps."""
+    segments: List[Dict[str, Any]] = []
+
+    if not raw_words:
+        return segments
+
+    for word in raw_words:
+        start = _get_attr(word, "start_time", "start_offset", "start")
+        end = _get_attr(word, "end_time", "end_offset", "end")
+        text = _get_attr(word, "text", "word", default="")
+
+        if start is not None and end is not None:
+            segments.append({
                 "start": float(start),
                 "end": float(end),
-                "text": str(token).strip(),
-            }
-        )
-    return converted
+                "text": str(text).strip(),
+            })
+
+    return segments
 
 
-def _safe_get(obj: Any, *keys: str, default: Any = None) -> Any:
+def _get_attr(obj: Any, *keys: str, default: Any = None) -> Any:
+    """Try multiple attribute/key names, return first found or default."""
+    # Try dict access
     if isinstance(obj, dict):
         for key in keys:
             if key in obj:
                 return obj[key]
+    # Try object attributes
     else:
         for key in keys:
             if hasattr(obj, key):
                 return getattr(obj, key)
+
     return default
-
-
-def load_engine() -> CanaryEngine:
-    return CanaryEngine.instance()
